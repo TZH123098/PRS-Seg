@@ -1,0 +1,580 @@
+import os
+from typing import List, Optional, Tuple
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from PIL import Image
+
+import open_clip
+
+from mmseg.models.segmentors import BaseSegmentor
+from mmengine.structures import PixelData
+from mmseg.registry import MODELS
+
+from sam3 import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
+
+
+@MODELS.register_module()
+class Segmentation(BaseSegmentor):
+
+    def __init__(
+        self,
+        classname_path: str,
+        sam3_ckpt: str = "weights/sam3/sam3.pt",
+        device: str = "cuda",
+        prob_thd: float = 0.0,
+        bg_idx: int = 0,
+        slide_stride: int = 0,
+        slide_crop: int = 0,
+        confidence_threshold: float = 0.5,
+        use_sem_seg: bool = True,
+        use_presence_score: bool = True,
+        use_transformer_decoder: bool = True,
+        openclip_model: str = "ViT-B-16",
+        openclip_pretrained: str = "./weights/openclip/open_clip_pytorch_model.bin",
+        prototype_bank_path: Optional[str] = None,
+        alpha_text_proto: float = 0.5,
+        scale_min: float = 0.95,
+        scale_max: float = 1.05,
+        reliability_power: float = 1.0,
+        use_prototype_bank: bool = True,
+        boundary_refine_strength: float = 0.30,
+        boundary_gate_scale: float = 8.0,
+        boundary_gate_bias: float = 0.15,
+        proto_boundary_suppress: float = 0.25,
+        presence_gate_strength: float = 0.10,
+        sem_conf_power: float = 1.0,
+        orientation_strength: float = 0.60,
+        highfreq_kernel_size: int = 3,
+        highfreq_sigma: float = 0.8,
+        boundary_smooth_weight: float = 0.06,
+        fusion_eps: float = 1e-6,
+        data_preprocessor=None,
+        init_cfg=None,
+        **kwargs,
+    ):
+        super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+
+        self.device_name = device if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(self.device_name)
+
+        self.prob_thd = prob_thd
+        self.bg_idx = bg_idx
+        self.slide_stride = slide_stride
+        self.slide_crop = slide_crop
+        self.confidence_threshold = confidence_threshold
+        self.use_sem_seg = use_sem_seg
+        self.use_presence_score = use_presence_score
+        self.use_transformer_decoder = use_transformer_decoder
+
+        self.alpha_text_proto = alpha_text_proto
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+        self.reliability_power = reliability_power
+        self.use_prototype_bank = use_prototype_bank
+
+
+        self.boundary_refine_strength = boundary_refine_strength
+        self.boundary_gate_scale = boundary_gate_scale
+        self.boundary_gate_bias = boundary_gate_bias
+        self.proto_boundary_suppress = proto_boundary_suppress
+        self.presence_gate_strength = presence_gate_strength
+        self.sem_conf_power = sem_conf_power
+        self.orientation_strength = orientation_strength
+        self.highfreq_kernel_size = highfreq_kernel_size
+        self.highfreq_sigma = highfreq_sigma
+        self.boundary_smooth_weight = boundary_smooth_weight
+        self.fusion_eps = fusion_eps
+        assert os.path.exists(sam3_ckpt), f"SAM3 checkpoint not found: {sam3_ckpt}"
+        model = build_sam3_image_model(
+            bpe_path="./sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+            checkpoint_path=sam3_ckpt,
+            device=self.device_name,
+            load_from_HF=False,
+        )
+        model = model.to(self.device)
+        model.eval()
+
+        for param in model.parameters():
+            param.requires_grad = False
+
+        self.processor = Sam3Processor(
+            model,
+            confidence_threshold=confidence_threshold,
+            device=self.device_name,
+        )
+
+        self.query_words, self.query_idx = get_cls_idx(classname_path)
+        self.num_cls = max(self.query_idx) + 1
+        self.num_queries = len(self.query_idx)
+        self.query_idx = torch.tensor(self.query_idx, dtype=torch.int64, device=self.device)
+
+        if os.path.isfile(openclip_pretrained):
+            print(f"[SegEarthOV3] loading local OpenCLIP weights from: {openclip_pretrained}")
+        else:
+            print(f"[SegEarthOV3] loading OpenCLIP pretrained tag: {openclip_pretrained}")
+
+        self.openclip_model, _, self.openclip_preprocess = open_clip.create_model_and_transforms(
+            openclip_model,
+            pretrained=openclip_pretrained
+        )
+        self.openclip_model = self.openclip_model.to(self.device).eval()
+        self.openclip_tokenizer = open_clip.get_tokenizer(openclip_model)
+
+        for p in self.openclip_model.parameters():
+            p.requires_grad = False
+
+        self.prototype_bank = {}
+        if prototype_bank_path is not None:
+            if not os.path.exists(prototype_bank_path):
+                raise FileNotFoundError(f"prototype bank not found: {prototype_bank_path}")
+            print(f"[SegEarthOV3] loading prototype bank from: {prototype_bank_path}")
+            self.prototype_bank = torch.load(prototype_bank_path, map_location="cpu")
+
+        self.text_embedding_cache = {}
+        print("[Proto keys]", list(self.prototype_bank.keys()))
+
+    @torch.no_grad()
+    def get_text_embedding(self, class_name: str) -> torch.Tensor:
+        if class_name in self.text_embedding_cache:
+            return self.text_embedding_cache[class_name]
+
+        names = [x.strip() for x in class_name.split(",") if len(x.strip()) > 0]
+        templates = [
+            "a satellite image of {}",
+            "an aerial image of {}",
+            "a remote sensing image of {}",
+            "top-down view of {}",
+            "overhead view of {}",
+            "{} in satellite imagery",
+        ]
+
+        prompts = []
+        for n in names:
+            for t in templates:
+                prompts.append(t.format(n))
+
+        tokens = self.openclip_tokenizer(prompts).to(self.device)
+        feat = self.openclip_model.encode_text(tokens)
+        feat = F.normalize(feat, dim=-1)
+        feat = feat.mean(dim=0, keepdim=True)
+        feat = F.normalize(feat, dim=-1)
+
+        self.text_embedding_cache[class_name] = feat
+        return feat
+
+    @torch.no_grad()
+    def get_image_embedding(self, image: Image.Image) -> torch.Tensor:
+        image_tensor = self.openclip_preprocess(image).unsqueeze(0).to(self.device)
+        feat = self.openclip_model.encode_image(image_tensor)
+        feat = F.normalize(feat, dim=-1)
+        return feat
+
+    @torch.no_grad()
+    def get_prototype_score(self, class_name: str, img_feat: torch.Tensor) -> Optional[torch.Tensor]:
+        if (not self.use_prototype_bank) or (class_name not in self.prototype_bank):
+            return None
+
+        proto = self.prototype_bank[class_name]
+        if not torch.is_tensor(proto):
+            proto = torch.tensor(proto, dtype=torch.float32)
+
+        proto = proto.to(self.device)
+        proto = F.normalize(proto, dim=-1)
+
+        sim = img_feat @ proto.t()
+        return sim.max(dim=1).values.squeeze(0)
+
+    @torch.no_grad()
+    def get_text_score(self, class_name: str, img_feat: torch.Tensor) -> torch.Tensor:
+        text_feat = self.get_text_embedding(class_name)
+        return (img_feat @ text_feat.t()).squeeze()
+
+    @torch.no_grad()
+    def compute_class_scale(self, class_name: str, image: Image.Image) -> float:
+
+        img_feat = self.get_image_embedding(image)
+        text_score = self.get_text_score(class_name, img_feat).clamp(0, 1)
+        proto_score = self.get_prototype_score(class_name, img_feat)
+
+        if proto_score is None:
+            score = text_score
+            reliability = torch.tensor(1.0, device=self.device)
+        else:
+            proto_score = proto_score.clamp(0, 1)
+            score = self.alpha_text_proto * text_score + (1.0 - self.alpha_text_proto) * proto_score
+            reliability = 1.0 - torch.abs(text_score - proto_score)
+            reliability = reliability.clamp(0, 1)
+
+        reliability = reliability.pow(self.reliability_power)
+        calibrated = 0.7 * score + 0.3 * (score * reliability)
+
+        scale = self.scale_min + (self.scale_max - self.scale_min) * calibrated
+        return float(scale.item())
+
+    @torch.no_grad()
+    def _to_scalar_tensor(self, x) -> torch.Tensor:
+        if torch.is_tensor(x):
+            x = x.to(self.device, dtype=torch.float32)
+        else:
+            x = torch.tensor(x, dtype=torch.float32, device=self.device)
+        return x.squeeze()
+
+    @torch.no_grad()
+    def _resize_logits(self, logits: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        if logits.shape != (h, w):
+            logits = F.interpolate(
+                logits.view(1, 1, *logits.shape),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+        return logits
+
+    @torch.no_grad()
+    def _entropy_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        prob = torch.sigmoid(logits).clamp(self.fusion_eps, 1.0 - self.fusion_eps)
+        entropy = -(prob * torch.log(prob) + (1.0 - prob) * torch.log(1.0 - prob))
+        entropy = entropy / 0.69314718056  # normalize by ln(2)
+        return entropy
+
+    @torch.no_grad()
+    def _scale_to_conf(self, scale: float) -> torch.Tensor:
+        denom = max(self.scale_max - self.scale_min, self.fusion_eps)
+        conf = (scale - self.scale_min) / denom
+        conf = max(0.0, min(1.0, conf))
+        return torch.tensor(conf, dtype=torch.float32, device=self.device)
+
+    @torch.no_grad()
+    def _get_gaussian_kernel(self, kernel_size: int, sigma: float) -> torch.Tensor:
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        coords = torch.arange(kernel_size, device=self.device, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        g = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+        g = g / g.sum()
+        kernel2d = torch.outer(g, g)
+        kernel2d = kernel2d / kernel2d.sum()
+        return kernel2d.view(1, 1, kernel_size, kernel_size)
+
+    @torch.no_grad()
+    def _gaussian_blur(self, x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
+        kernel = self._get_gaussian_kernel(kernel_size, sigma)
+        pad = kernel_size // 2
+        x4 = x.view(1, 1, *x.shape)
+        out = F.conv2d(F.pad(x4, (pad, pad, pad, pad), mode="reflect"), kernel)
+        return out.squeeze(0).squeeze(0)
+
+    @torch.no_grad()
+    def _sobel_magnitude(self, x: torch.Tensor) -> torch.Tensor:
+        kx = torch.tensor(
+            [[-1.0, 0.0, 1.0],
+             [-2.0, 0.0, 2.0],
+             [-1.0, 0.0, 1.0]],
+            device=self.device
+        ).view(1, 1, 3, 3)
+
+        ky = torch.tensor(
+            [[-1.0, -2.0, -1.0],
+             [ 0.0,  0.0,  0.0],
+             [ 1.0,  2.0,  1.0]],
+            device=self.device
+        ).view(1, 1, 3, 3)
+
+        x4 = x.view(1, 1, *x.shape)
+        xpad = F.pad(x4, (1, 1, 1, 1), mode="reflect")
+        gx = F.conv2d(xpad, kx).squeeze(0).squeeze(0)
+        gy = F.conv2d(xpad, ky).squeeze(0).squeeze(0)
+        return torch.sqrt(gx * gx + gy * gy + self.fusion_eps)
+
+    @torch.no_grad()
+    def _normalize_nonnegative_map(self, x: torch.Tensor) -> torch.Tensor:
+        xmax = x.max()
+        if xmax <= self.fusion_eps:
+            return torch.zeros_like(x)
+        return x / xmax
+
+    @torch.no_grad()
+    def _directional_edge_response(self, x: torch.Tensor) -> torch.Tensor:
+
+        kernels = torch.tensor(
+            [
+                [[1.0,  0.0, -1.0],
+                 [1.0,  0.0, -1.0],
+                 [1.0,  0.0, -1.0]],
+
+                [[1.0,  1.0,  0.0],
+                 [1.0,  0.0, -1.0],
+                 [0.0, -1.0, -1.0]],
+
+                [[1.0,  1.0,  1.0],
+                 [0.0,  0.0,  0.0],
+                 [-1.0, -1.0, -1.0]],
+
+                [[0.0,  1.0,  1.0],
+                 [-1.0, 0.0,  1.0],
+                 [-1.0, -1.0, 0.0]],
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        ).unsqueeze(1)  # [4,1,3,3]
+
+        x4 = x.view(1, 1, *x.shape)
+        xpad = F.pad(x4, (1, 1, 1, 1), mode="reflect")
+        resp = F.conv2d(xpad, kernels).abs().squeeze(0) 
+        resp = resp.max(dim=0).values                    
+        return self._normalize_nonnegative_map(resp)
+
+    @torch.no_grad()
+    def _compute_structure_anchor(self, inference_state: dict, h: int, w: int, mask_scale: float) -> torch.Tensor:
+
+        S = torch.zeros((h, w), device=self.device)
+
+        if self.use_transformer_decoder and inference_state["masks_logits"].shape[0] > 0:
+            inst_len = inference_state["masks_logits"].shape[0]
+            for inst_id in range(inst_len):
+                instance_logits = inference_state["masks_logits"][inst_id].squeeze()
+                instance_score = inference_state["object_score"][inst_id]
+
+                instance_logits = self._resize_logits(instance_logits, h, w)
+
+                instance_logits = instance_logits * mask_scale
+
+                S = torch.max(S, instance_logits * instance_score)
+
+        return S
+
+    @torch.no_grad()
+    def _compute_semantic_map(self, inference_state: dict, h: int, w: int) -> torch.Tensor:
+        M = inference_state["semantic_mask_logits"]
+
+        if M.dim() == 4:
+            M = M.squeeze(0)
+        if M.dim() == 3 and M.shape[0] == 1:
+            M = M.squeeze(0)
+
+        M = self._resize_logits(M, h, w)
+        return M
+
+
+    @torch.no_grad()
+    def _inference_single_view(self, image: Image.Image) -> torch.Tensor:
+        w, h = image.size
+        seg_logits = torch.zeros((self.num_queries, h, w), device=self.device)
+
+        inference_state = self.processor.set_image(image)
+
+        for query_idx, query_word in enumerate(self.query_words):
+ 
+            scale = self.compute_class_scale(query_word, image)
+            scale_conf = self._scale_to_conf(scale)
+
+            mask_scale = max(0.95, min(1.05, scale))
+
+            self.processor.reset_all_prompts(inference_state)
+            inference_state = self.processor.set_text_prompt(
+                state=inference_state,
+                prompt=query_word
+            )
+
+            S = self._compute_structure_anchor(
+                inference_state=inference_state,
+                h=h,
+                w=w,
+                mask_scale=mask_scale,
+            )
+
+            has_sem = self.use_sem_seg and ("semantic_mask_logits" in inference_state)
+
+            if has_sem:
+                M = self._compute_semantic_map(
+                    inference_state=inference_state,
+                    h=h,
+                    w=w,
+                )
+
+                base_fused = torch.max(S, M)
+
+                conflict = torch.abs(torch.sigmoid(S) - torch.sigmoid(M))  # [H,W]
+                edge_energy = self._normalize_nonnegative_map(
+                    self._sobel_magnitude(S) + self._sobel_magnitude(M)
+                )
+
+                boundary_band = torch.sigmoid(
+                    self.boundary_gate_scale * (conflict + edge_energy - self.boundary_gate_bias)
+                )
+
+                sem_conf = torch.exp(-self._entropy_from_logits(M)).pow(self.sem_conf_power)
+
+                if self.use_presence_score and "presence_score" in inference_state:
+                    presence_score = self._to_scalar_tensor(inference_state["presence_score"]).clamp(0, 1)
+                else:
+                    presence_score = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+
+                presence_factor = (
+                    1.0 - self.presence_gate_strength
+                    + self.presence_gate_strength * presence_score
+                )
+
+                proto_factor = 1.0 - self.proto_boundary_suppress * scale_conf
+
+                refine_gate = (
+                    self.boundary_refine_strength
+                    * boundary_band
+                    * sem_conf
+                    * presence_factor
+                    * proto_factor
+                ).clamp(0.0, 1.0)
+
+  
+                M_blur = self._gaussian_blur(
+                    M,
+                    kernel_size=self.highfreq_kernel_size,
+                    sigma=self.highfreq_sigma,
+                )
+                highfreq = M - M_blur
+                conflict_res = M - S
+
+                orient_resp = self._directional_edge_response(M)
+
+                boundary_residual = (
+                    0.7 * conflict_res
+                    + 0.3 * ((1.0 + self.orientation_strength * orient_resp) * highfreq)
+                )
+
+                refined = base_fused + refine_gate * boundary_residual
+
+                if self.boundary_smooth_weight > 0:
+                    refined_blur = self._gaussian_blur(refined, kernel_size=3, sigma=0.8)
+                    refined = (
+                        (1.0 - self.boundary_smooth_weight * boundary_band) * refined
+                        + (self.boundary_smooth_weight * boundary_band) * refined_blur
+                    )
+
+                seg_logits[query_idx] = refined
+            else:
+                seg_logits[query_idx] = S
+
+            if self.use_presence_score and "presence_score" in inference_state:
+                seg_logits[query_idx] = seg_logits[query_idx] * inference_state["presence_score"]
+
+        return seg_logits
+
+    @torch.no_grad()
+    def slide_inference(self, image: Image.Image, stride: int, crop_size: int) -> torch.Tensor:
+        w_img, h_img = image.size
+
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(crop_size, int):
+            crop_size = (crop_size, crop_size)
+
+        h_stride, w_stride = stride
+        h_crop, w_crop = crop_size
+
+        preds = torch.zeros((self.num_queries, h_img, w_img), device=self.device)
+        count_mat = torch.zeros((1, h_img, w_img), device=self.device)
+
+        h_grids = max(h_img - h_crop + h_stride - 1, 0) // h_stride + 1
+        w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1
+
+        for h_idx in range(h_grids):
+            for w_idx in range(w_grids):
+                y1 = h_idx * h_stride
+                x1 = w_idx * w_stride
+                y2 = min(y1 + h_crop, h_img)
+                x2 = min(x1 + w_crop, w_img)
+
+                y1 = max(y2 - h_crop, 0)
+                x1 = max(x2 - w_crop, 0)
+
+                crop_img = image.crop((x1, y1, x2, y2))
+                crop_seg_logit = self._inference_single_view(crop_img)
+
+                preds[:, y1:y2, x1:x2] += crop_seg_logit
+                count_mat[:, y1:y2, x1:x2] += 1
+
+        assert (count_mat == 0).sum() == 0
+        preds = preds / count_mat
+        return preds
+
+    @torch.no_grad()
+    def predict(self, inputs, data_samples):
+        if data_samples is not None:
+            batch_img_metas = [d.metainfo for d in data_samples]
+        else:
+            batch_img_metas = [
+                dict(
+                    ori_shape=inputs.shape[2:],
+                    img_shape=inputs.shape[2:],
+                    pad_shape=inputs.shape[2:],
+                    padding_size=[0, 0, 0, 0],
+                )
+            ] * inputs.shape[0]
+
+        for i, meta in enumerate(batch_img_metas):
+            image_path = meta.get("img_path")
+            image = Image.open(image_path).convert("RGB")
+            ori_shape = meta["ori_shape"]
+
+            if self.slide_crop > 0 and (self.slide_crop < image.size[0] or self.slide_crop < image.size[1]):
+                seg_logits = self.slide_inference(image, self.slide_stride, self.slide_crop)
+            else:
+                seg_logits = self._inference_single_view(image)
+
+            if seg_logits.shape[-2:] != ori_shape:
+                seg_logits = F.interpolate(
+                    seg_logits.unsqueeze(0),
+                    size=ori_shape,
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+
+            if self.num_cls != self.num_queries:
+                seg_logits = seg_logits.unsqueeze(0)
+                cls_index = nn.functional.one_hot(self.query_idx)
+                cls_index = cls_index.T.view(self.num_cls, len(self.query_idx), 1, 1)
+                seg_logits = (seg_logits * cls_index).max(1)[0]
+
+            seg_pred = torch.argmax(seg_logits, dim=0)
+            max_vals = seg_logits.max(0)[0]
+            seg_pred[max_vals < self.prob_thd] = self.bg_idx
+
+            data_samples[i].set_data({
+                "seg_logits": PixelData(data=seg_logits.detach().cpu()),
+                "pred_sem_seg": PixelData(data=seg_pred.unsqueeze(0).detach().cpu()),
+            })
+
+        return data_samples
+
+    def _forward(self, inputs, data_samples=None):
+        return self.inference(inputs, None)
+
+    def encode_decode(self, inputs, batch_img_metas):
+        return self.inference(inputs, batch_img_metas)
+
+    def extract_feat(self, inputs):
+        return None
+
+    def loss(self, inputs, data_samples):
+        raise NotImplementedError("Inference-only model")
+
+    @torch.no_grad()
+    def inference(self, img, batch_img_metas=None):
+        return img
+
+
+def get_cls_idx(path: str) -> Tuple[List[str], List[int]]:
+    with open(path, "r", encoding="utf-8") as f:
+        name_sets = f.readlines()
+
+    class_names, class_indices = [], []
+    for idx, line in enumerate(name_sets):
+        names_i = [i.strip() for i in line.split(",")]
+        class_names += names_i
+        class_indices += [idx] * len(names_i)
+
+    class_names = [item.replace("\n", "") for item in class_names]
+    return class_names, class_indices
